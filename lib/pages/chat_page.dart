@@ -203,10 +203,22 @@ class _ChatPageState extends State<ChatPage> {
         column: 'chat_room_id',
         value: chatRoomId,
       ),
-      callback: (payload) {
-        if (mounted) {
-          setState(() => messages.add(payload.newRecord));
+      callback: (payload) async {
+        if (!mounted) return;
+
+        try {
+          final decrypted =
+          await decryptMessages([payload.newRecord]);
+
+          if (!mounted) return;
+
+          setState(() {
+            messages.add(decrypted.first);
+          });
+
           scrollToBottom();
+        } catch (e) {
+          debugPrint("Realtime decrypt error: $e");
         }
       },
     )
