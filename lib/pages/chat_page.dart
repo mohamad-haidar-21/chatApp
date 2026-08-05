@@ -1,6 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../models/encrypted_message.dart';
+import '../services/crypto_service.dart';
+import '../services/key_storage.dart';
+
 class ChatPage extends StatefulWidget {
   final String otherUserId;
   final String otherUsername;
@@ -80,18 +84,106 @@ class _ChatPageState extends State<ChatPage> {
       setState(() => isLoading = false);
     }
   }
+  Future<List<Map<String, dynamic>>> decryptMessages(
+      List<dynamic> data) async {
+
+    final cryptoService = CryptoService();
+    final storage = KeyStorage();
+
+    final myPrivateKey = await storage.getPrivateKey();
+    final myPublicKey = await storage.getPublicKey();
+
+    if (myPrivateKey == null || myPublicKey == null) {
+      throw Exception("Encryption keys not found");
+    }
+
+
+    List<Map<String, dynamic>> decryptedMessages = [];
+
+
+    for (final message in data) {
+
+      try {
+
+        // Get sender public key
+        final sender = await supabase
+            .from('users')
+            .select('public_key')
+            .eq('id', message['sender_id'])
+            .single();
+
+
+        final senderPublicKey = sender['public_key'];
+
+
+        // Create shared key
+        final sharedKey = await cryptoService.deriveSharedKey(
+          myPrivateKeyHex: myPrivateKey,
+          myPublicKeyHex: myPublicKey,
+          otherPublicKeyHex: senderPublicKey,
+        );
+
+
+        // Create encrypted message object
+        final encryptedMessage = EncryptedMessage(
+          content: message['content'],
+          nonce: message['nonce'],
+          mac: message['mac'],
+        );
+
+
+        // Decrypt
+        final decryptedText = await cryptoService.decryptMessage(
+          sharedKey: sharedKey,
+          encryptedMessage: encryptedMessage,
+        );
+
+
+        decryptedMessages.add({
+          ...message,
+          'content': decryptedText,
+        });
+
+
+      } catch (e) {
+
+        debugPrint(
+          "Message decrypt error: $e",
+        );
+
+
+        decryptedMessages.add({
+          ...message,
+          'content': "[Unable to decrypt]",
+        });
+
+      }
+    }
+
+
+    return decryptedMessages;
+  }
 
   Future<void> loadMessages() async {
     if (chatRoomId == null) return;
 
     try {
+
       final data = await supabase
           .from('messages')
           .select()
           .eq('chat_room_id', chatRoomId!)
           .order('created_at', ascending: true);
 
-      setState(() => messages = data);
+
+      final decrypted = await decryptMessages(data);
+
+
+      setState(() {
+        messages = decrypted;
+      });
+
+
     } catch (e) {
       debugPrint('Error loading messages: $e');
     }
@@ -123,26 +215,79 @@ class _ChatPageState extends State<ChatPage> {
 
   Future<void> sendMessage() async {
     final content = messageController.text.trim();
+
     if (content.isEmpty || chatRoomId == null) return;
+
+    final cryptoService = CryptoService();
+    final storage = KeyStorage();
 
     try {
       final currentUserId = supabase.auth.currentUser!.id;
-      messageController.clear();
 
+      // Get my keys
+      final myPrivateKey = await storage.getPrivateKey();
+      final myPublicKey = await storage.getPublicKey();
+
+      if (myPrivateKey == null || myPublicKey == null) {
+        throw Exception("Encryption keys not found.");
+      }
+
+
+      // Get receiver public key
+      final receiver = await supabase
+          .from('users')
+          .select('public_key')
+          .eq('id', widget.otherUserId)
+          .single();
+
+      final receiverPublicKey = receiver['public_key'] as String;
+
+
+      if (receiverPublicKey.isEmpty) {
+        throw Exception("Receiver has no public key.");
+      }
+
+
+      // Create shared secret
+      final sharedKey = await cryptoService.deriveSharedKey(
+        myPrivateKeyHex: myPrivateKey,
+        myPublicKeyHex: myPublicKey,
+        otherPublicKeyHex: receiverPublicKey,
+      );
+
+
+      // Encrypt message
+      final encrypted = await cryptoService.encryptMessage(
+        sharedKey: sharedKey,
+        message: content,
+      );
+
+
+      // Save encrypted message
       await supabase.from('messages').insert({
         'chat_room_id': chatRoomId,
         'sender_id': currentUserId,
-        'content': content,
+        'content': encrypted.content,
+        'nonce': encrypted.nonce,
+        'mac': encrypted.mac,
       });
+
+
+      messageController.clear();
+
 
       await supabase
           .from('chat_rooms')
-          .update({'updated_at': DateTime.now().toIso8601String()})
+          .update({
+        'updated_at': DateTime.now().toIso8601String(),
+      })
           .eq('id', chatRoomId!);
 
+
       scrollToBottom();
+
     } catch (e) {
-      debugPrint('Error sending message: $e');
+      debugPrint("Send Message Error: $e");
     }
   }
 
