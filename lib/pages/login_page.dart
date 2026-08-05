@@ -1,5 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import '../services/crypto_service.dart';
+import '../services/key_manager.dart';
+import '../services/key_storage.dart';
 import 'home_page.dart';
 import 'signup_page.dart';
 
@@ -55,12 +58,15 @@ class _LoginPageState extends State<LoginPage> {
         email: email,
         password: password,
       );
+      if (response.user != null) {
+        await initializeEncryptionKeys();
 
-      if (response.user != null && mounted) {
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (_) => const HomePage()),
-        );
+        if (mounted) {
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(builder: (_) => const HomePage()),
+          );
+        }
       }
     } on AuthException catch (e) {
       if (mounted) {
@@ -78,7 +84,88 @@ class _LoginPageState extends State<LoginPage> {
 
     setState(() => isLoading = false);
   }
+  Future<void> initializeEncryptionKeys() async {
+    final cryptoService = CryptoService();
+    final storage = KeyStorage();
 
+    final currentUser = supabase.auth.currentUser;
+
+    if (currentUser == null) {
+      debugPrint("No logged user");
+      return;
+    }
+
+
+    final localPrivateKey = await storage.getPrivateKey();
+    final localPublicKey = await storage.getPublicKey();
+
+
+    // Check if user already has public key in database
+    final userData = await supabase
+        .from('users')
+        .select('public_key')
+        .eq('id', currentUser.id)
+        .single();
+
+
+    final databasePublicKey = userData['public_key'];
+
+
+    debugPrint("Local public key: $localPublicKey");
+    debugPrint("Database public key: $databasePublicKey");
+
+
+    // Case 1: Everything exists
+    if (localPrivateKey != null &&
+        localPublicKey != null &&
+        databasePublicKey != null) {
+
+      debugPrint("Keys already synchronized");
+      return;
+    }
+
+
+    // Case 2: Local keys exist but database missing public key
+    if (localPublicKey != null && localPrivateKey != null) {
+
+      await supabase
+          .from('users')
+          .update({
+        'public_key': localPublicKey,
+      })
+          .eq('id', currentUser.id);
+
+
+      debugPrint("Uploaded existing public key");
+      return;
+    }
+
+
+    // Case 3: Generate new keys
+    final keyPair = await cryptoService.generateKeyPair();
+
+
+    final publicKey =
+    await cryptoService.getPublicKey(keyPair);
+
+    final privateKey =
+    await cryptoService.getPrivateKey(keyPair);
+
+
+    await storage.savePrivateKey(privateKey);
+    await storage.savePublicKey(publicKey);
+
+
+    await supabase
+        .from('users')
+        .update({
+      'public_key': publicKey,
+    })
+        .eq('id', currentUser.id);
+
+
+    debugPrint("New encryption keys created");
+  }
   @override
   void dispose() {
     usernameController.dispose();
