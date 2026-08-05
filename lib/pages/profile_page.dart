@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'login_page.dart';
 
 class ProfilePage extends StatefulWidget {
   const ProfilePage({super.key});
@@ -36,6 +37,22 @@ class _ProfilePageState extends State<ProfilePage> {
       username = response != null ? response['username'] : '';
       isLoading = false;
     });
+  }
+  Future<void> logout() async {
+    try {
+      await supabase.auth.signOut();
+
+      if (!mounted) return;
+
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const LoginPage()),
+            (route) => false,
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Logout failed: $e")),
+      );
+    }
   }
 
   @override
@@ -78,6 +95,21 @@ class _ProfilePageState extends State<ProfilePage> {
                 );
               },
               child: const Text("Change Password"),
+            ),
+            const SizedBox(height: 15),
+
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: logout,
+                icon: const Icon(Icons.logout),
+                label: const Text("Logout"),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.red,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                ),
+              ),
             ),
           ],
         ),
