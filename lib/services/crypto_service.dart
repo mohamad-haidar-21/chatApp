@@ -4,6 +4,8 @@ import 'dart:typed_data';
 import 'package:convert/convert.dart';
 import 'package:cryptography/cryptography.dart';
 import '../models/encrypted_message.dart';
+import '../models/encrypted_file.dart';
+
 class CryptoService {
   final X25519 algorithm = X25519();
 
@@ -52,10 +54,30 @@ class CryptoService {
     required SecretKey sharedKey,
     required String message,
   }) async {
+    return encryptBytes(
+      sharedKey: sharedKey,
+      bytes: Uint8List.fromList(utf8.encode(message)),
+    );
+  }
+  Future<String> decryptMessage({
+    required SecretKey sharedKey,
+    required EncryptedMessage encryptedMessage,
+  }) async {
+    final bytes = await decryptBytes(
+      sharedKey: sharedKey,
+      encryptedMessage: encryptedMessage,
+    );
+
+    return utf8.decode(bytes);
+  }
+  Future<EncryptedMessage> encryptBytes({
+    required SecretKey sharedKey,
+    required Uint8List bytes,
+  }) async {
     final nonce = cipher.newNonce();
 
     final secretBox = await cipher.encrypt(
-      message.codeUnits,
+      bytes,
       secretKey: sharedKey,
       nonce: nonce,
     );
@@ -66,7 +88,8 @@ class CryptoService {
       mac: hex.encode(secretBox.mac.bytes),
     );
   }
-  Future<String> decryptMessage({
+
+  Future<Uint8List> decryptBytes({
     required SecretKey sharedKey,
     required EncryptedMessage encryptedMessage,
   }) async {
@@ -76,11 +99,48 @@ class CryptoService {
       mac: Mac(hex.decode(encryptedMessage.mac)),
     );
 
-    final clearText = await cipher.decrypt(
+    final decrypted = await cipher.decrypt(
       secretBox,
       secretKey: sharedKey,
     );
 
-    return String.fromCharCodes(clearText);
+    return Uint8List.fromList(decrypted);
+  }
+  Future<EncryptedFile> encryptFile({
+    required SecretKey sharedKey,
+    required Uint8List bytes,
+  }) async {
+    final nonce = cipher.newNonce();
+
+    final secretBox = await cipher.encrypt(
+      bytes,
+      secretKey: sharedKey,
+      nonce: nonce,
+    );
+
+    return EncryptedFile(
+      encryptedBytes: Uint8List.fromList(secretBox.cipherText),
+      nonce: hex.encode(secretBox.nonce),
+      mac: hex.encode(secretBox.mac.bytes),
+    );
+  }
+  Future<Uint8List> decryptFile({
+    required SecretKey sharedKey,
+    required Uint8List encryptedBytes,
+    required String nonce,
+    required String mac,
+  }) async {
+    final secretBox = SecretBox(
+      encryptedBytes,
+      nonce: hex.decode(nonce),
+      mac: Mac(hex.decode(mac)),
+    );
+
+    final decrypted = await cipher.decrypt(
+      secretBox,
+      secretKey: sharedKey,
+    );
+
+    return Uint8List.fromList(decrypted);
   }
 }
