@@ -1,9 +1,18 @@
+import 'dart:typed_data';
+import 'dart:io';
+
+import 'package:cryptography/cryptography.dart';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:record/record.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:just_audio/just_audio.dart';
 
 import '../models/encrypted_message.dart';
 import '../services/crypto_service.dart';
+import '../services/image_service.dart';
 import '../services/key_storage.dart';
+import '../services/storage_service.dart';
 
 class ChatPage extends StatefulWidget {
   final String otherUserId;
@@ -27,6 +36,15 @@ class _ChatPageState extends State<ChatPage> {
   final supabase = Supabase.instance.client;
   final messageController = TextEditingController();
   final scrollController = ScrollController();
+
+  final AudioRecorder audioRecorder = AudioRecorder();
+
+  String? audioPath;
+
+  bool isRecording = false;
+  String? playingVoiceId;
+  bool isPlaying = false;
+  final AudioPlayer audioPlayer = AudioPlayer();
 
   List<dynamic> messages = [];
   String? chatRoomId;
@@ -97,13 +115,30 @@ class _ChatPageState extends State<ChatPage> {
       throw Exception("Encryption keys not found");
     }
 
-
     List<Map<String, dynamic>> decryptedMessages = [];
 
 
     for (final message in data) {
 
       try {
+
+        // Detect message type first
+        final messageType = message['message_type'] ?? 'text';
+
+
+        debugPrint("MESSAGE TYPE: $messageType");
+        debugPrint("IMAGE URL: ${message['image_url']}");
+        if (messageType == 'image' || messageType == 'voice') {
+
+          decryptedMessages.add({
+            ...message,
+            'content': message['content'],
+          });
+
+          continue;
+        }
+
+
 
         // Get sender public key
         final sender = await supabase
@@ -116,6 +151,12 @@ class _ChatPageState extends State<ChatPage> {
         final senderPublicKey = sender['public_key'];
 
 
+        if (senderPublicKey == null) {
+          throw Exception("Sender public key missing");
+        }
+
+
+
         // Create shared key
         final sharedKey = await cryptoService.deriveSharedKey(
           myPrivateKeyHex: myPrivateKey,
@@ -123,8 +164,6 @@ class _ChatPageState extends State<ChatPage> {
           otherPublicKeyHex: senderPublicKey,
         );
 
-
-        // Create encrypted message object
         final encryptedMessage = EncryptedMessage(
           content: message['content'],
           nonce: message['nonce'],
@@ -132,17 +171,19 @@ class _ChatPageState extends State<ChatPage> {
         );
 
 
-        // Decrypt
+
         final decryptedText = await cryptoService.decryptMessage(
           sharedKey: sharedKey,
           encryptedMessage: encryptedMessage,
         );
 
 
+
         decryptedMessages.add({
           ...message,
           'content': decryptedText,
         });
+
 
 
       } catch (e) {
@@ -152,17 +193,29 @@ class _ChatPageState extends State<ChatPage> {
         );
 
 
-        decryptedMessages.add({
-          ...message,
-          'content': "[Unable to decrypt]",
-        });
+        // Keep image messages even if something fails
+        if (message['message_type'] == 'image' ) {
 
+          decryptedMessages.add({
+            ...message,
+            'content': '',
+          });
+
+        } else {
+
+          decryptedMessages.add({
+            ...message,
+            'content': '[Unable to decrypt]',
+          });
+
+        }
       }
     }
 
 
     return decryptedMessages;
   }
+
 
   Future<void> loadMessages() async {
     if (chatRoomId == null) return;
@@ -188,6 +241,100 @@ class _ChatPageState extends State<ChatPage> {
       debugPrint('Error loading messages: $e');
     }
   }
+  Future<void> startRecording() async {
+
+    if (!await audioRecorder.hasPermission()) {
+      return;
+    }
+
+
+    final directory = await getTemporaryDirectory();
+
+
+    audioPath =
+    "${directory.path}/voice_${DateTime.now().millisecondsSinceEpoch}.m4a";
+
+
+    await audioRecorder.start(
+      const RecordConfig(
+        encoder: AudioEncoder.aacLc,
+      ),
+      path: audioPath!,
+    );
+
+
+    setState(() {
+      isRecording = true;
+    });
+
+  }
+  Future<void> stopRecording() async {
+
+    final path = await audioRecorder.stop();
+
+
+    setState(() {
+      isRecording = false;
+    });
+
+
+    if(path != null){
+
+      await sendVoiceMessage(path);
+
+    }
+
+  }
+  Future<String> uploadVoice(String path) async {
+
+    final file = File(path);
+
+    final filePath =
+        "${supabase.auth.currentUser!.id}/${DateTime.now().millisecondsSinceEpoch}.m4a";
+
+
+    await supabase.storage
+        .from('chat-voices')
+        .upload(
+      filePath,
+      file,
+    );
+
+
+    final url = supabase.storage
+        .from('chat-voices')
+        .getPublicUrl(filePath);
+
+
+    print("VOICE URL: $url");
+
+
+    return url;
+  }
+  Future<void> sendVoiceMessage(String path) async {
+
+
+    final url = await uploadVoice(path);
+
+
+    await supabase
+        .from('messages')
+        .insert({
+
+      'chat_room_id': chatRoomId,
+
+      'sender_id':
+      supabase.auth.currentUser!.id,
+
+      'content': url,
+
+      'message_type': 'voice',
+
+    });
+
+
+  }
+
 
   void setupRealtimeListener() {
     if (chatRoomId == null) return;
@@ -231,62 +378,28 @@ class _ChatPageState extends State<ChatPage> {
     if (content.isEmpty || chatRoomId == null) return;
 
     final cryptoService = CryptoService();
-    final storage = KeyStorage();
 
     try {
       final currentUserId = supabase.auth.currentUser!.id;
 
-      // Get my keys
-      final myPrivateKey = await storage.getPrivateKey();
-      final myPublicKey = await storage.getPublicKey();
+      final sharedKey = await getSharedKey();
 
-      if (myPrivateKey == null || myPublicKey == null) {
-        throw Exception("Encryption keys not found.");
-      }
-
-
-      // Get receiver public key
-      final receiver = await supabase
-          .from('users')
-          .select('public_key')
-          .eq('id', widget.otherUserId)
-          .single();
-
-      final receiverPublicKey = receiver['public_key'] as String;
-
-
-      if (receiverPublicKey.isEmpty) {
-        throw Exception("Receiver has no public key.");
-      }
-
-
-      // Create shared secret
-      final sharedKey = await cryptoService.deriveSharedKey(
-        myPrivateKeyHex: myPrivateKey,
-        myPublicKeyHex: myPublicKey,
-        otherPublicKeyHex: receiverPublicKey,
-      );
-
-
-      // Encrypt message
       final encrypted = await cryptoService.encryptMessage(
         sharedKey: sharedKey,
         message: content,
       );
 
-
-      // Save encrypted message
       await supabase.from('messages').insert({
         'chat_room_id': chatRoomId,
         'sender_id': currentUserId,
+        'message_type': 'text',
         'content': encrypted.content,
         'nonce': encrypted.nonce,
         'mac': encrypted.mac,
+        'media_path': null,
       });
 
-
       messageController.clear();
-
 
       await supabase
           .from('chat_rooms')
@@ -295,14 +408,11 @@ class _ChatPageState extends State<ChatPage> {
       })
           .eq('id', chatRoomId!);
 
-
       scrollToBottom();
-
     } catch (e) {
       debugPrint("Send Message Error: $e");
     }
   }
-
   void scrollToBottom() {
     if (scrollController.hasClients) {
       Future.delayed(const Duration(milliseconds: 120), () {
@@ -316,6 +426,90 @@ class _ChatPageState extends State<ChatPage> {
       });
     }
   }
+  Future<void> sendImage(File imageFile) async {
+    try {
+      final user = supabase.auth.currentUser;
+
+      if (user == null) {
+        throw Exception("User not logged in");
+      }
+
+      // Create a unique file path
+      final filePath =
+          '${user.id}/${chatRoomId}/${DateTime.now().millisecondsSinceEpoch}.jpg';
+
+
+      // Upload image to Supabase Storage
+      await supabase.storage
+          .from('chat-media')
+          .upload(
+        filePath,
+        imageFile,
+      );
+
+
+      // Get public URL
+      final imageUrl = supabase.storage
+          .from('chat-media')
+          .getPublicUrl(filePath);
+
+
+      // Insert message into messages table
+      await supabase.from('messages').insert({
+        'chat_room_id': chatRoomId,
+        'sender_id': user.id,
+        'image_url': imageUrl,
+        'content': '',
+        'message_type': 'image',
+      });
+
+
+      print("Image sent successfully");
+
+    } catch (e) {
+      print("Send Image Error: $e");
+    }
+  }
+  Future<SecretKey> getSharedKey() async {
+    final cryptoService = CryptoService();
+    final storage = KeyStorage();
+
+    final myPrivateKey = await storage.getPrivateKey();
+    final myPublicKey = await storage.getPublicKey();
+
+    if (myPrivateKey == null || myPublicKey == null) {
+      throw Exception("Encryption keys not found.");
+    }
+
+    final receiver = await supabase
+        .from('users')
+        .select('public_key')
+        .eq('id', widget.otherUserId)
+        .single();
+
+    final receiverPublicKey = receiver['public_key'] as String?;
+
+    if (receiverPublicKey == null || receiverPublicKey.isEmpty) {
+      throw Exception(
+        "Recipient (${widget.otherUserId}) has no public key yet — they need to log in once to generate one.",
+      );
+    }
+
+    return cryptoService.deriveSharedKey(
+      myPrivateKeyHex: myPrivateKey,
+      myPublicKeyHex: myPublicKey,
+      otherPublicKeyHex: receiverPublicKey,
+    );
+  }
+  Future<void> pickAndSendImage() async {
+    final imageService = ImageService();
+    final image = await imageService.pickImageFromGallery();
+
+    if (image != null) {
+      await sendImage(image);
+    }
+  }
+
 
   Widget buildMessage(dynamic message) {
     final currentUserId = supabase.auth.currentUser!.id;
@@ -346,16 +540,112 @@ class _ChatPageState extends State<ChatPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              message['content'],
-              style: TextStyle(
-                color: isMe
-                    ? Colors.white
-                    : (isDarkMode ? Colors.white : Colors.black),
-                fontSize: 16,
+
+            if (message['message_type'] == 'image')
+              ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: Image.network(
+                  message['image_url'],
+                  width: 220,
+                  height: 220,
+                  fit: BoxFit.cover,
+
+                  loadingBuilder: (context, child, loadingProgress) {
+                    if (loadingProgress == null) {
+                      return child;
+                    }
+
+                    return SizedBox(
+                      width: 220,
+                      height: 220,
+                      child: Center(
+                        child: CircularProgressIndicator(
+                          value: loadingProgress.expectedTotalBytes != null
+                              ? loadingProgress.cumulativeBytesLoaded /
+                              loadingProgress.expectedTotalBytes!
+                              : null,
+                        ),
+                      ),
+                    );
+                  },
+
+                  errorBuilder: (context, error, stackTrace) {
+                    debugPrint("IMAGE LOAD ERROR: $error");
+                    debugPrint("IMAGE URL: ${message['image_url']}");
+
+                    return const Center(
+                      child: Icon(Icons.error),
+                    );
+                  },
+                ),
+              )
+
+            else if (message['message_type'] == 'voice')
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+
+                  IconButton(
+                    icon: Icon(
+                      playingVoiceId == message['id'] && isPlaying
+                          ? Icons.pause
+                          : Icons.play_arrow,
+                      color: Colors.white,
+                    ),
+                    onPressed: () async {
+
+                      final id = message['id'];
+
+                      if (playingVoiceId == id && isPlaying) {
+
+                        await audioPlayer.pause();
+
+                        setState(() {
+                          isPlaying = false;
+                        });
+
+                      } else {
+
+                        await audioPlayer.setUrl(
+                          message['content'],
+                        );
+
+                        await audioPlayer.play();
+
+                        setState(() {
+                          playingVoiceId = id;
+                          isPlaying = true;
+                        });
+
+                      }
+                    },
+                  ),
+                  const Text(
+                    "Voice message",
+                    style: TextStyle(
+                      fontSize: 15,
+                    ),
+                  ),
+
+                ],
+              )
+
+
+            else
+              Text(
+                message['content'],
+                style: TextStyle(
+                  color: isMe
+                      ? Colors.white
+                      : (isDarkMode ? Colors.white : Colors.black),
+                  fontSize: 16,
+                ),
               ),
-            ),
+
+
             const SizedBox(height: 4),
+
+
             Text(
               time,
               style: TextStyle(
@@ -457,38 +747,59 @@ class _ChatPageState extends State<ChatPage> {
                 Expanded(
                   child: Container(
                     decoration: BoxDecoration(
-                      color: isDarkMode
-                          ? Colors.grey[800]
-                          : Colors.grey[200],
+                      color: isDarkMode ? Colors.grey[800] : Colors.grey[200],
                       borderRadius: BorderRadius.circular(24),
                     ),
                     child: TextField(
                       controller: messageController,
                       style: TextStyle(
-                          color: isDarkMode
-                              ? Colors.white
-                              : Colors.black),
+                        color: isDarkMode ? Colors.white : Colors.black,
+                      ),
                       decoration: InputDecoration(
                         hintText: "Type a message...",
                         hintStyle: TextStyle(
-                          color:
-                          isDarkMode ? Colors.grey[400] : Colors.grey,
+                          color: isDarkMode ? Colors.grey[400] : Colors.grey,
                         ),
                         border: InputBorder.none,
                         contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 20, vertical: 10),
+                          horizontal: 20,
+                          vertical: 10,
+                        ),
                       ),
                     ),
                   ),
                 ),
-                const SizedBox(width: 8),
+
+                IconButton(
+                  icon: const Icon(Icons.attach_file),
+                  onPressed: pickAndSendImage,
+                ),
+
+                const SizedBox(width: 4),
+
                 CircleAvatar(
                   backgroundColor: Colors.blue,
-                  radius: 24,
-                  child: IconButton(
-                    icon: const Icon(Icons.send,
-                        color: Colors.white, size: 20),
+                  child: messageController.text.isNotEmpty
+                      ? IconButton(
+                    icon: const Icon(
+                      Icons.send,
+                      color: Colors.white,
+                    ),
                     onPressed: sendMessage,
+                  )
+                      : GestureDetector(
+                    onLongPressStart: (_) async {
+                      await startRecording();
+                    },
+                    onLongPressEnd: (_) async {
+                      await stopRecording();
+                    },
+                    child: Icon(
+                      isRecording
+                          ? Icons.mic
+                          : Icons.mic_none,
+                      color: Colors.white,
+                    ),
                   ),
                 ),
               ],
