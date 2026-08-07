@@ -44,6 +44,7 @@ class _ChatPageState extends State<ChatPage> {
   bool isRecording = false;
   String? playingVoiceId;
   bool isPlaying = false;
+  Map<String, dynamic>? replyingTo;
   final AudioPlayer audioPlayer = AudioPlayer();
 
   List<dynamic> messages = [];
@@ -56,15 +57,19 @@ class _ChatPageState extends State<ChatPage> {
   @override
   void initState() {
     super.initState();
-    isDarkMode = widget.isDarkMode; // 👈 inherit theme
+    isDarkMode = widget.isDarkMode;
     initializeChat();
+    messageController.addListener(_onMessageChanged);
   }
-
+  void _onMessageChanged() {
+    if (mounted) {
+      setState(() {});
+    }
+  }
   @override
   void dispose() {
+    messageController.removeListener(_onMessageChanged);
     messageController.dispose();
-    scrollController.dispose();
-    channel?.unsubscribe();
     super.dispose();
   }
 
@@ -102,9 +107,36 @@ class _ChatPageState extends State<ChatPage> {
       setState(() => isLoading = false);
     }
   }
-  Future<List<Map<String, dynamic>>> decryptMessages(
-      List<dynamic> data) async {
+  Future<String> decryptSingleMessage(
+      Map<String, dynamic> message,
+      String myPrivateKey,
+      String myPublicKey,
+      ) async {
 
+    final cryptoService = CryptoService();
+
+    final sender = await supabase
+        .from('users')
+        .select('public_key')
+        .eq('id', message['sender_id'])
+        .single();
+
+    final sharedKey = await cryptoService.deriveSharedKey(
+      myPrivateKeyHex: myPrivateKey,
+      myPublicKeyHex: myPublicKey,
+      otherPublicKeyHex: sender['public_key'],
+    );
+
+    return await cryptoService.decryptMessage(
+      sharedKey: sharedKey,
+      encryptedMessage: EncryptedMessage(
+        content: message['content'],
+        nonce: message['nonce'],
+        mac: message['mac'],
+      ),
+    );
+  }
+  Future<List<Map<String, dynamic>>> decryptMessages(List data) async {
     final cryptoService = CryptoService();
     final storage = KeyStorage();
 
@@ -117,101 +149,76 @@ class _ChatPageState extends State<ChatPage> {
 
     List<Map<String, dynamic>> decryptedMessages = [];
 
-
     for (final message in data) {
-
       try {
+        final Map<String, dynamic> msg = Map<String, dynamic>.from(message);
 
-        // Detect message type first
-        final messageType = message['message_type'] ?? 'text';
-
-
-        debugPrint("MESSAGE TYPE: $messageType");
-        debugPrint("IMAGE URL: ${message['image_url']}");
-        if (messageType == 'image' || messageType == 'voice') {
-
-          decryptedMessages.add({
-            ...message,
-            'content': message['content'],
-          });
-
-          continue;
+        // Decrypt the main message
+        if (msg['message_type'] == 'text') {
+          msg['content'] = await decryptSingleMessage(
+            msg,
+            myPrivateKey,
+            myPublicKey,
+          );
         }
 
+        // Decrypt the replied message (if any)
+        if (msg['reply_content'] != null &&
+            msg['reply_type'] == 'text' &&
+            msg['reply_sender_id'] != null) {
 
+          // Get the PUBLIC KEY of the person who originally
+          // sent the message we are replying to.
+          final replySender = await supabase
+              .from('users')
+              .select('public_key')
+              .eq('id', msg['reply_sender_id'])
+              .single();
 
-        // Get sender public key
-        final sender = await supabase
-            .from('users')
-            .select('public_key')
-            .eq('id', message['sender_id'])
-            .single();
+          final replySenderPublicKey =
+          replySender['public_key'];
 
+          if (replySenderPublicKey == null) {
+            throw Exception(
+              "Reply sender public key missing",
+            );
+          }
 
-        final senderPublicKey = sender['public_key'];
+          // Create shared key with the ORIGINAL sender
+          final replySharedKey =
+          await cryptoService.deriveSharedKey(
+            myPrivateKeyHex: myPrivateKey,
+            myPublicKeyHex: myPublicKey,
+            otherPublicKeyHex: replySenderPublicKey,
+          );
 
+          final replyEncrypted =
+          EncryptedMessage(
+            content: msg['reply_content'],
+            nonce: msg['reply_nonce'],
+            mac: msg['reply_mac'],
+          );
 
-        if (senderPublicKey == null) {
-          throw Exception("Sender public key missing");
+          final replyText =
+          await cryptoService.decryptMessage(
+            sharedKey: replySharedKey,
+            encryptedMessage: replyEncrypted,
+          );
+
+          // Store decrypted reply in memory
+          msg['reply_content'] = replyText;
         }
 
-
-
-        // Create shared key
-        final sharedKey = await cryptoService.deriveSharedKey(
-          myPrivateKeyHex: myPrivateKey,
-          myPublicKeyHex: myPublicKey,
-          otherPublicKeyHex: senderPublicKey,
-        );
-
-        final encryptedMessage = EncryptedMessage(
-          content: message['content'],
-          nonce: message['nonce'],
-          mac: message['mac'],
-        );
-
-
-
-        final decryptedText = await cryptoService.decryptMessage(
-          sharedKey: sharedKey,
-          encryptedMessage: encryptedMessage,
-        );
-
-
+        decryptedMessages.add(msg);
+      } catch (e) {
+        debugPrint("Decrypt error: $e");
 
         decryptedMessages.add({
           ...message,
-          'content': decryptedText,
+          'content': '[Unable to decrypt]',
         });
-
-
-
-      } catch (e) {
-
-        debugPrint(
-          "Message decrypt error: $e",
-        );
-
-
-        // Keep image messages even if something fails
-        if (message['message_type'] == 'image' ) {
-
-          decryptedMessages.add({
-            ...message,
-            'content': '',
-          });
-
-        } else {
-
-          decryptedMessages.add({
-            ...message,
-            'content': '[Unable to decrypt]',
-          });
-
-        }
       }
     }
-
 
     return decryptedMessages;
   }
@@ -221,22 +228,54 @@ class _ChatPageState extends State<ChatPage> {
     if (chatRoomId == null) return;
 
     try {
-
       final data = await supabase
           .from('messages')
           .select()
           .eq('chat_room_id', chatRoomId!)
           .order('created_at', ascending: true);
 
+      for (final message in data) {
+        if (message['reply_to'] != null) {
+          try {
+            final replied = await supabase
+                .from('messages')
+                .select(
+              'id, sender_id, content, message_type, nonce, mac',
+            )
+                .eq('id', message['reply_to'])
+                .single();
+
+            final sender = await supabase
+                .from('users')
+                .select('username, public_key')
+                .eq('id', replied['sender_id'])
+                .single();
+
+            message['reply_sender_id'] = replied['sender_id'];
+            message['reply_content'] = replied['content'];
+            message['reply_type'] = replied['message_type'];
+            message['reply_nonce'] = replied['nonce'];
+            message['reply_mac'] = replied['mac'];
+            message['reply_sender'] = sender['username'];
+
+            debugPrint("========== REPLY ==========");
+            debugPrint("reply_to: ${message['reply_to']}");
+            debugPrint("reply_sender: ${message['reply_sender']}");
+            debugPrint("reply_sender_id: ${message['reply_sender_id']}");
+            debugPrint("reply_content: ${message['reply_content']}");
+            debugPrint("reply_type: ${message['reply_type']}");
+            debugPrint("============================");
+          } catch (e) {
+            debugPrint("Error loading replied message: $e");
+          }
+        }
+      }
 
       final decrypted = await decryptMessages(data);
-
 
       setState(() {
         messages = decrypted;
       });
-
-
     } catch (e) {
       debugPrint('Error loading messages: $e');
     }
@@ -329,9 +368,12 @@ class _ChatPageState extends State<ChatPage> {
       'content': url,
 
       'message_type': 'voice',
+      'reply_to': replyingTo?['id'],
 
     });
-
+    setState(() {
+      replyingTo = null;
+    });
 
   }
 
@@ -397,9 +439,14 @@ class _ChatPageState extends State<ChatPage> {
         'nonce': encrypted.nonce,
         'mac': encrypted.mac,
         'media_path': null,
+        'reply_to': replyingTo?['id'],
       });
 
       messageController.clear();
+
+      setState(() {
+        replyingTo = null;
+      });
 
       await supabase
           .from('chat_rooms')
@@ -514,153 +561,208 @@ class _ChatPageState extends State<ChatPage> {
   Widget buildMessage(dynamic message) {
     final currentUserId = supabase.auth.currentUser!.id;
     final isMe = message['sender_id'] == currentUserId;
+
     final timestamp = DateTime.parse(message['created_at']);
     final time =
         '${timestamp.hour.toString().padLeft(2, '0')}:${timestamp.minute.toString().padLeft(2, '0')}';
 
-    return Align(
-      alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 12),
-        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
-        constraints: BoxConstraints(
-          maxWidth: MediaQuery.of(context).size.width * 0.7,
-        ),
-        decoration: BoxDecoration(
-          color: isMe
-              ? Colors.blue
-              : (isDarkMode ? Colors.grey[800] : Colors.grey[300]),
-          borderRadius: BorderRadius.only(
-            topLeft: const Radius.circular(16),
-            topRight: const Radius.circular(16),
-            bottomLeft: Radius.circular(isMe ? 16 : 4),
-            bottomRight: Radius.circular(isMe ? 4 : 16),
+    return GestureDetector(
+      onLongPress: () {
+        debugPrint("Long pressed message: ${message['id']}");
+        setState(() {
+          replyingTo = message;
+        });
+      },
+      child: Align(
+        alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+        child: Container(
+          margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 12),
+          padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
+          constraints: BoxConstraints(
+            maxWidth: MediaQuery.of(context).size.width * 0.7,
           ),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
+          decoration: BoxDecoration(
+            color: isMe
+                ? Colors.blue
+                : (isDarkMode ? Colors.grey[800] : Colors.grey[300]),
+            borderRadius: BorderRadius.only(
+              topLeft: const Radius.circular(16),
+              topRight: const Radius.circular(16),
+              bottomLeft: Radius.circular(isMe ? 16 : 4),
+              bottomRight: Radius.circular(isMe ? 4 : 16),
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
 
-            if (message['message_type'] == 'image')
-              ClipRRect(
-                borderRadius: BorderRadius.circular(12),
-                child: Image.network(
-                  message['image_url'],
-                  width: 220,
-                  height: 220,
-                  fit: BoxFit.cover,
+              /// Reply Preview
+              if (message['reply_to'] != null) ...[
+                Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.only(bottom: 8),
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(8),
+                    border: const Border(
+                      left: BorderSide(
+                        color: Colors.white,
+                        width: 3,
+                      ),
+                    ),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
 
-                  loadingBuilder: (context, child, loadingProgress) {
-                    if (loadingProgress == null) {
-                      return child;
-                    }
-
-                    return SizedBox(
-                      width: 220,
-                      height: 220,
-                      child: Center(
-                        child: CircularProgressIndicator(
-                          value: loadingProgress.expectedTotalBytes != null
-                              ? loadingProgress.cumulativeBytesLoaded /
-                              loadingProgress.expectedTotalBytes!
-                              : null,
+                      Text(
+                        message['reply_sender'] ?? '',
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                          fontSize: 12,
                         ),
                       ),
-                    );
-                  },
 
-                  errorBuilder: (context, error, stackTrace) {
-                    debugPrint("IMAGE LOAD ERROR: $error");
-                    debugPrint("IMAGE URL: ${message['image_url']}");
+                      const SizedBox(height: 2),
 
-                    return const Center(
-                      child: Icon(Icons.error),
-                    );
-                  },
+                      Text(
+                        message['reply_content'] ?? '',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-              )
+              ],
 
-            else if (message['message_type'] == 'voice')
+              /// Image
+              if (message['message_type'] == 'image')
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: Image.network(
+                    message['image_url'],
+                    width: 220,
+                    height: 220,
+                    fit: BoxFit.cover,
+                    loadingBuilder: (context, child, loadingProgress) {
+                      if (loadingProgress == null) return child;
+
+                      return SizedBox(
+                        width: 220,
+                        height: 220,
+                        child: Center(
+                          child: CircularProgressIndicator(
+                            value: loadingProgress.expectedTotalBytes != null
+                                ? loadingProgress.cumulativeBytesLoaded /
+                                loadingProgress.expectedTotalBytes!
+                                : null,
+                          ),
+                        ),
+                      );
+                    },
+                    errorBuilder: (context, error, stackTrace) {
+                      return const Center(
+                        child: Icon(Icons.error),
+                      );
+                    },
+                  ),
+                )
+
+              /// Voice
+              else if (message['message_type'] == 'voice')
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+
+                    IconButton(
+                      icon: Icon(
+                        playingVoiceId == message['id'] && isPlaying
+                            ? Icons.pause
+                            : Icons.play_arrow,
+                        color: Colors.white,
+                      ),
+                      onPressed: () async {
+
+                        final id = message['id'];
+
+                        if (playingVoiceId == id && isPlaying) {
+
+                          await audioPlayer.pause();
+
+                          setState(() {
+                            isPlaying = false;
+                          });
+
+                        } else {
+
+                          await audioPlayer.setUrl(
+                            message['content'],
+                          );
+
+                          await audioPlayer.play();
+
+                          setState(() {
+                            playingVoiceId = id;
+                            isPlaying = true;
+                          });
+
+                        }
+                      },
+                    ),
+
+                    const Text(
+                      "Voice message",
+                      style: TextStyle(fontSize: 15),
+                    ),
+                  ],
+                )
+
+              /// Text
+              else
+                Text(
+                  message['content'],
+                  style: TextStyle(
+                    color: isMe
+                        ? Colors.white
+                        : (isDarkMode ? Colors.white : Colors.black),
+                    fontSize: 16,
+                  ),
+                ),
+
+              const SizedBox(height: 4),
+
               Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
 
-                  IconButton(
-                    icon: Icon(
-                      playingVoiceId == message['id'] && isPlaying
-                          ? Icons.pause
-                          : Icons.play_arrow,
-                      color: Colors.white,
-                    ),
-                    onPressed: () async {
-
-                      final id = message['id'];
-
-                      if (playingVoiceId == id && isPlaying) {
-
-                        await audioPlayer.pause();
-
-                        setState(() {
-                          isPlaying = false;
-                        });
-
-                      } else {
-
-                        await audioPlayer.setUrl(
-                          message['content'],
-                        );
-
-                        await audioPlayer.play();
-
-                        setState(() {
-                          playingVoiceId = id;
-                          isPlaying = true;
-                        });
-
-                      }
-                    },
-                  ),
-                  const Text(
-                    "Voice message",
+                  Text(
+                    time,
                     style: TextStyle(
-                      fontSize: 15,
+                      color: isMe
+                          ? Colors.white70
+                          : (isDarkMode ? Colors.grey[400] : Colors.black54),
+                      fontSize: 11,
                     ),
                   ),
 
+                  if (isMe) ...[
+                    const SizedBox(width: 4),
+                    buildMessageStatus(message),
+                  ],
                 ],
-              )
-
-
-            else
-              Text(
-                message['content'],
-                style: TextStyle(
-                  color: isMe
-                      ? Colors.white
-                      : (isDarkMode ? Colors.white : Colors.black),
-                  fontSize: 16,
-                ),
               ),
-
-
-            const SizedBox(height: 4),
-
-
-            Text(
-              time,
-              style: TextStyle(
-                color: isMe
-                    ? Colors.white70
-                    : (isDarkMode ? Colors.grey[400] : Colors.black54),
-                fontSize: 11,
-              ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
   }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -730,83 +832,184 @@ class _ChatPageState extends State<ChatPage> {
 
           // INPUT BAR
           Container(
-            padding:
-            const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
             decoration: BoxDecoration(
               color: isDarkMode ? Colors.black : Colors.white,
-              boxShadow: [
+              boxShadow: const [
                 BoxShadow(
                   color: Colors.black26,
                   blurRadius: 3,
-                  offset: const Offset(0, -1),
-                )
+                  offset: Offset(0, -1),
+                ),
               ],
             ),
-            child: Row(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
               children: [
-                Expanded(
-                  child: Container(
+
+                /// Reply Preview
+                if (replyingTo != null)
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
                     decoration: BoxDecoration(
-                      color: isDarkMode ? Colors.grey[800] : Colors.grey[200],
-                      borderRadius: BorderRadius.circular(24),
+                      color: Colors.blue.withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(12),
+                      border: const Border(
+                        left: BorderSide(
+                          color: Colors.blue,
+                          width: 4,
+                        ),
+                      ),
                     ),
-                    child: TextField(
-                      controller: messageController,
-                      style: TextStyle(
-                        color: isDarkMode ? Colors.white : Colors.black,
-                      ),
-                      decoration: InputDecoration(
-                        hintText: "Type a message...",
-                        hintStyle: TextStyle(
-                          color: isDarkMode ? Colors.grey[400] : Colors.grey,
+                    child: Row(
+                      children: [
+
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+
+                              const Text(
+                                "Replying to",
+                                style: TextStyle(
+                                  color: Colors.blue,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+
+                              const SizedBox(height: 2),
+
+                              Text(
+                                replyingTo!['message_type'] == 'text'
+                                    ? replyingTo!['content']
+                                    : replyingTo!['message_type'].toUpperCase(),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ],
+                          ),
                         ),
-                        border: InputBorder.none,
-                        contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 20,
-                          vertical: 10,
+
+                        IconButton(
+                          icon: const Icon(Icons.close),
+                          onPressed: () {
+                            setState(() {
+                              replyingTo = null;
+                            });
+                            messageController.clear();
+                          },
                         ),
-                      ),
+                      ],
                     ),
                   ),
-                ),
 
-                IconButton(
-                  icon: const Icon(Icons.attach_file),
-                  onPressed: pickAndSendImage,
-                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+                  child: Row(
+                    children: [
 
-                const SizedBox(width: 4),
+                      Expanded(
+                        child: Container(
+                          decoration: BoxDecoration(
+                            color: isDarkMode
+                                ? Colors.grey[800]
+                                : Colors.grey[200],
+                            borderRadius: BorderRadius.circular(24),
+                          ),
+                          child: TextField(
+                            controller: messageController,
+                            style: TextStyle(
+                              color:
+                              isDarkMode ? Colors.white : Colors.black,
+                            ),
+                            decoration: InputDecoration(
+                              hintText: "Type a message...",
+                              hintStyle: TextStyle(
+                                color: isDarkMode
+                                    ? Colors.grey[400]
+                                    : Colors.grey,
+                              ),
+                              border: InputBorder.none,
+                              contentPadding:
+                              const EdgeInsets.symmetric(
+                                horizontal: 20,
+                                vertical: 10,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
 
-                CircleAvatar(
-                  backgroundColor: Colors.blue,
-                  child: messageController.text.isNotEmpty
-                      ? IconButton(
-                    icon: const Icon(
-                      Icons.send,
-                      color: Colors.white,
-                    ),
-                    onPressed: sendMessage,
-                  )
-                      : GestureDetector(
-                    onLongPressStart: (_) async {
-                      await startRecording();
-                    },
-                    onLongPressEnd: (_) async {
-                      await stopRecording();
-                    },
-                    child: Icon(
-                      isRecording
-                          ? Icons.mic
-                          : Icons.mic_none,
-                      color: Colors.white,
-                    ),
+                      IconButton(
+                        icon: const Icon(Icons.attach_file),
+                        onPressed: pickAndSendImage,
+                      ),
+
+                      const SizedBox(width: 4),
+
+                      CircleAvatar(
+                        backgroundColor: Colors.blue,
+                        child: messageController.text.isNotEmpty
+                            ? IconButton(
+                          icon: const Icon(
+                            Icons.send,
+                            color: Colors.white,
+                          ),
+                          onPressed: sendMessage,
+                        )
+                            : GestureDetector(
+                          onLongPressStart: (_) async {
+                            await startRecording();
+                          },
+                          onLongPressEnd: (_) async {
+                            await stopRecording();
+                          },
+                          child: Icon(
+                            isRecording
+                                ? Icons.mic
+                                : Icons.mic_none,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ],
             ),
-          ),
+          )
         ],
       ),
     );
+  }
+  Widget buildMessageStatus(Map<String, dynamic> message) {
+    final status = message['status'] ?? 'sent';
+
+    switch (status) {
+      case 'sent':
+        return const Icon(
+          Icons.done,
+          size: 16,
+          color: Colors.white70,
+        );
+
+      case 'delivered':
+        return const Icon(
+          Icons.done_all,
+          size: 16,
+          color: Colors.white70,
+        );
+
+      case 'read':
+        return const Icon(
+          Icons.done_all,
+          size: 16,
+          color: Colors.lightBlueAccent,
+        );
+
+      default:
+        return const SizedBox();
+    }
   }
 }
