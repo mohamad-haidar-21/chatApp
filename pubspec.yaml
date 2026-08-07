@@ -36,6 +36,11 @@ dependencies:
   cryptography_flutter: ^2.3.0
   flutter_secure_storage: ^9.2.2
   convert: ^3.1.1
+  image_picker: ^1.2.0
+  path_provider: ^2.1.5
+  mime: ^2.0.0
+  record: ^6.0.0
+  just_audio: ^0.9.46
 
 
   # The following adds the Cupertino Icons font to your application.
