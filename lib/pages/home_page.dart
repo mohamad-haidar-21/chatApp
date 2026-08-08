@@ -169,7 +169,11 @@ class _HomePageState extends State<HomePage> {
             onPressed: () {
               Navigator.push(
                 context,
-                MaterialPageRoute(builder: (_) => const ProfilePage()),
+                MaterialPageRoute(
+                    builder: (_) => ProfilePage(
+                      isDarkMode: isDarkMode,
+                    ),
+                ),
               );
             },
           ),

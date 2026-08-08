@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 import 'dart:io';
+import 'dart:async';
 
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter/material.dart';
@@ -46,7 +47,10 @@ class _ChatPageState extends State<ChatPage> {
   bool isPlaying = false;
   Map<String, dynamic>? replyingTo;
   final AudioPlayer audioPlayer = AudioPlayer();
-
+  DateTime? recordingStartTime;
+  Duration recordingDuration = Duration.zero;
+  Timer? recordingTimer;
+  String? loadingVoiceId;
   List<dynamic> messages = [];
   String? chatRoomId;
   bool isLoading = true;
@@ -61,15 +65,18 @@ class _ChatPageState extends State<ChatPage> {
     initializeChat();
     messageController.addListener(_onMessageChanged);
   }
+
   void _onMessageChanged() {
     if (mounted) {
       setState(() {});
     }
   }
+
   @override
   void dispose() {
     messageController.removeListener(_onMessageChanged);
     messageController.dispose();
+    recordingTimer?.cancel();
     super.dispose();
   }
 
@@ -80,14 +87,19 @@ class _ChatPageState extends State<ChatPage> {
       var room = await supabase
           .from('chat_rooms')
           .select()
-          .or('and(user1.eq.$currentUserId,user2.eq.${widget.otherUserId}),and(user1.eq.${widget.otherUserId},user2.eq.$currentUserId)')
+          .or(
+        'and(user1.eq.$currentUserId,user2.eq.${widget
+            .otherUserId}),and(user1.eq.${widget
+            .otherUserId},user2.eq.$currentUserId)',
+      )
           .maybeSingle();
 
       if (room == null) {
-        room = await supabase.from('chat_rooms').insert({
-          'user1': currentUserId,
-          'user2': widget.otherUserId,
-        }).select().single();
+        room = await supabase
+            .from('chat_rooms')
+            .insert({'user1': currentUserId, 'user2': widget.otherUserId})
+            .select()
+            .single();
       }
 
       chatRoomId = room['id'];
@@ -100,19 +112,17 @@ class _ChatPageState extends State<ChatPage> {
     } catch (e) {
       debugPrint('Error initializing chat: $e');
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error initializing chat: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Error initializing chat: $e')));
       }
       setState(() => isLoading = false);
     }
   }
-  Future<String> decryptSingleMessage(
-      Map<String, dynamic> message,
-      String myPrivateKey,
-      String myPublicKey,
-      ) async {
 
+  Future<String> decryptSingleMessage(Map<String, dynamic> message,
+      String myPrivateKey,
+      String myPublicKey,) async {
     final cryptoService = CryptoService();
 
     final sender = await supabase
@@ -136,6 +146,7 @@ class _ChatPageState extends State<ChatPage> {
       ),
     );
   }
+
   Future<List<Map<String, dynamic>>> decryptMessages(List data) async {
     final cryptoService = CryptoService();
     final storage = KeyStorage();
@@ -166,7 +177,6 @@ class _ChatPageState extends State<ChatPage> {
         if (msg['reply_content'] != null &&
             msg['reply_type'] == 'text' &&
             msg['reply_sender_id'] != null) {
-
           // Get the PUBLIC KEY of the person who originally
           // sent the message we are replying to.
           final replySender = await supabase
@@ -175,32 +185,26 @@ class _ChatPageState extends State<ChatPage> {
               .eq('id', msg['reply_sender_id'])
               .single();
 
-          final replySenderPublicKey =
-          replySender['public_key'];
+          final replySenderPublicKey = replySender['public_key'];
 
           if (replySenderPublicKey == null) {
-            throw Exception(
-              "Reply sender public key missing",
-            );
+            throw Exception("Reply sender public key missing");
           }
 
           // Create shared key with the ORIGINAL sender
-          final replySharedKey =
-          await cryptoService.deriveSharedKey(
+          final replySharedKey = await cryptoService.deriveSharedKey(
             myPrivateKeyHex: myPrivateKey,
             myPublicKeyHex: myPublicKey,
             otherPublicKeyHex: replySenderPublicKey,
           );
 
-          final replyEncrypted =
-          EncryptedMessage(
+          final replyEncrypted = EncryptedMessage(
             content: msg['reply_content'],
             nonce: msg['reply_nonce'],
             mac: msg['reply_mac'],
           );
 
-          final replyText =
-          await cryptoService.decryptMessage(
+          final replyText = await cryptoService.decryptMessage(
             sharedKey: replySharedKey,
             encryptedMessage: replyEncrypted,
           );
@@ -213,16 +217,12 @@ class _ChatPageState extends State<ChatPage> {
       } catch (e) {
         debugPrint("Decrypt error: $e");
 
-        decryptedMessages.add({
-          ...message,
-          'content': '[Unable to decrypt]',
-        });
+        decryptedMessages.add({...message, 'content': '[Unable to decrypt]'});
       }
     }
 
     return decryptedMessages;
   }
-
 
   Future<void> loadMessages() async {
     if (chatRoomId == null) return;
@@ -239,9 +239,7 @@ class _ChatPageState extends State<ChatPage> {
           try {
             final replied = await supabase
                 .from('messages')
-                .select(
-              'id, sender_id, content, message_type, nonce, mac',
-            )
+                .select('id, sender_id, content, message_type, nonce, mac')
                 .eq('id', message['reply_to'])
                 .single();
 
@@ -280,19 +278,18 @@ class _ChatPageState extends State<ChatPage> {
       debugPrint('Error loading messages: $e');
     }
   }
-  Future<void> startRecording() async {
 
+  Future<void> startRecording() async {
     if (!await audioRecorder.hasPermission()) {
       return;
     }
 
-
     final directory = await getTemporaryDirectory();
 
-
     audioPath =
-    "${directory.path}/voice_${DateTime.now().millisecondsSinceEpoch}.m4a";
-
+    "${directory.path}/voice_${DateTime
+        .now()
+        .millisecondsSinceEpoch}.m4a";
 
     await audioRecorder.start(
       const RecordConfig(
@@ -301,82 +298,79 @@ class _ChatPageState extends State<ChatPage> {
       path: audioPath!,
     );
 
+    recordingStartTime = DateTime.now();
+
+    recordingTimer?.cancel();
+
+    recordingTimer = Timer.periodic(
+      const Duration(seconds: 1),
+          (_) {
+        if (!mounted || recordingStartTime == null) return;
+
+        setState(() {
+          recordingDuration =
+              DateTime.now().difference(recordingStartTime!);
+        });
+      },
+    );
 
     setState(() {
       isRecording = true;
+      recordingDuration = Duration.zero;
     });
-
   }
-  Future<void> stopRecording() async {
 
+  Future<void> stopRecording() async {
     final path = await audioRecorder.stop();
 
+    recordingTimer?.cancel();
+    recordingTimer = null;
 
     setState(() {
       isRecording = false;
+      recordingDuration = Duration.zero;
+      recordingStartTime = null;
     });
 
-
-    if(path != null){
-
+    if (path != null) {
       await sendVoiceMessage(path);
-
     }
-
   }
-  Future<String> uploadVoice(String path) async {
 
+  Future<String> uploadVoice(String path) async {
     final file = File(path);
 
     final filePath =
-        "${supabase.auth.currentUser!.id}/${DateTime.now().millisecondsSinceEpoch}.m4a";
+        "${supabase.auth.currentUser!.id}/${DateTime
+        .now()
+        .millisecondsSinceEpoch}.m4a";
 
+    await supabase.storage.from('chat-voices').upload(filePath, file);
 
-    await supabase.storage
-        .from('chat-voices')
-        .upload(
-      filePath,
-      file,
-    );
-
-
-    final url = supabase.storage
-        .from('chat-voices')
-        .getPublicUrl(filePath);
-
+    final url = supabase.storage.from('chat-voices').getPublicUrl(filePath);
 
     print("VOICE URL: $url");
 
-
     return url;
   }
+
   Future<void> sendVoiceMessage(String path) async {
-
-
     final url = await uploadVoice(path);
 
-
-    await supabase
-        .from('messages')
-        .insert({
-
+    await supabase.from('messages').insert({
       'chat_room_id': chatRoomId,
 
-      'sender_id':
-      supabase.auth.currentUser!.id,
+      'sender_id': supabase.auth.currentUser!.id,
 
       'content': url,
 
       'message_type': 'voice',
       'reply_to': replyingTo?['id'],
-
     });
     setState(() {
       replyingTo = null;
     });
-
   }
-
 
   void setupRealtimeListener() {
     if (chatRoomId == null) return;
@@ -396,8 +390,7 @@ class _ChatPageState extends State<ChatPage> {
         if (!mounted) return;
 
         try {
-          final decrypted =
-          await decryptMessages([payload.newRecord]);
+          final decrypted = await decryptMessages([payload.newRecord]);
 
           if (!mounted) return;
 
@@ -450,9 +443,7 @@ class _ChatPageState extends State<ChatPage> {
 
       await supabase
           .from('chat_rooms')
-          .update({
-        'updated_at': DateTime.now().toIso8601String(),
-      })
+          .update({'updated_at': DateTime.now().toIso8601String()})
           .eq('id', chatRoomId!);
 
       scrollToBottom();
@@ -460,6 +451,7 @@ class _ChatPageState extends State<ChatPage> {
       debugPrint("Send Message Error: $e");
     }
   }
+
   void scrollToBottom() {
     if (scrollController.hasClients) {
       Future.delayed(const Duration(milliseconds: 120), () {
@@ -473,6 +465,7 @@ class _ChatPageState extends State<ChatPage> {
       });
     }
   }
+
   Future<void> sendImage(File imageFile) async {
     try {
       final user = supabase.auth.currentUser;
@@ -483,23 +476,17 @@ class _ChatPageState extends State<ChatPage> {
 
       // Create a unique file path
       final filePath =
-          '${user.id}/${chatRoomId}/${DateTime.now().millisecondsSinceEpoch}.jpg';
-
+          '${user.id}/${chatRoomId}/${DateTime
+          .now()
+          .millisecondsSinceEpoch}.jpg';
 
       // Upload image to Supabase Storage
-      await supabase.storage
-          .from('chat-media')
-          .upload(
-        filePath,
-        imageFile,
-      );
-
+      await supabase.storage.from('chat-media').upload(filePath, imageFile);
 
       // Get public URL
       final imageUrl = supabase.storage
           .from('chat-media')
           .getPublicUrl(filePath);
-
 
       // Insert message into messages table
       await supabase.from('messages').insert({
@@ -510,13 +497,12 @@ class _ChatPageState extends State<ChatPage> {
         'message_type': 'image',
       });
 
-
       print("Image sent successfully");
-
     } catch (e) {
       print("Send Image Error: $e");
     }
   }
+
   Future<SecretKey> getSharedKey() async {
     final cryptoService = CryptoService();
     final storage = KeyStorage();
@@ -538,7 +524,8 @@ class _ChatPageState extends State<ChatPage> {
 
     if (receiverPublicKey == null || receiverPublicKey.isEmpty) {
       throw Exception(
-        "Recipient (${widget.otherUserId}) has no public key yet — they need to log in once to generate one.",
+        "Recipient (${widget
+            .otherUserId}) has no public key yet — they need to log in once to generate one.",
       );
     }
 
@@ -548,6 +535,7 @@ class _ChatPageState extends State<ChatPage> {
       otherPublicKeyHex: receiverPublicKey,
     );
   }
+
   Future<void> pickAndSendImage() async {
     final imageService = ImageService();
     final image = await imageService.pickImageFromGallery();
@@ -557,6 +545,15 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
+  String _formatRecordingDuration(Duration duration) {
+    final minutes =
+    duration.inMinutes.remainder(60).toString().padLeft(2, '0');
+
+    final seconds =
+    duration.inSeconds.remainder(60).toString().padLeft(2, '0');
+
+    return '$minutes:$seconds';
+  }
 
   Widget buildMessage(dynamic message) {
     final currentUserId = supabase.auth.currentUser!.id;
@@ -564,217 +561,290 @@ class _ChatPageState extends State<ChatPage> {
 
     final timestamp = DateTime.parse(message['created_at']);
     final time =
-        '${timestamp.hour.toString().padLeft(2, '0')}:${timestamp.minute.toString().padLeft(2, '0')}';
+        '${timestamp.hour.toString().padLeft(2, '0')}:${timestamp.minute
+        .toString().padLeft(2, '0')}';
 
     return GestureDetector(
-      onLongPress: () {
-        debugPrint("Long pressed message: ${message['id']}");
-        setState(() {
-          replyingTo = message;
-        });
-      },
-      child: Align(
-        alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
-        child: Container(
-          margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 12),
-          padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
-          constraints: BoxConstraints(
-            maxWidth: MediaQuery.of(context).size.width * 0.7,
-          ),
-          decoration: BoxDecoration(
-            color: isMe
-                ? Colors.blue
-                : (isDarkMode ? Colors.grey[800] : Colors.grey[300]),
-            borderRadius: BorderRadius.only(
-              topLeft: const Radius.circular(16),
-              topRight: const Radius.circular(16),
-              bottomLeft: Radius.circular(isMe ? 16 : 4),
-              bottomRight: Radius.circular(isMe ? 4 : 16),
-            ),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-
+        onLongPress: () {
+          debugPrint("Long pressed message: ${message['id']}");
+          setState(() {
+            replyingTo = message;
+          });
+        },
+        child: Align(
+            alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+            child: Container(
+              margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 12),
+              padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
+              constraints: BoxConstraints(
+                maxWidth: MediaQuery
+                    .of(context)
+                    .size
+                    .width * 0.7,
+              ),
+              decoration: BoxDecoration(
+                color: isMe
+                    ? Colors.blue
+                    : (isDarkMode ? Colors.grey[800] : Colors.grey[300]),
+                borderRadius: BorderRadius.only(
+                  topLeft: const Radius.circular(16),
+                  topRight: const Radius.circular(16),
+                  bottomLeft: Radius.circular(isMe ? 16 : 4),
+                  bottomRight: Radius.circular(isMe ? 4 : 16),
+                ),
+              ),
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
               /// Reply Preview
               if (message['reply_to'] != null) ...[
-                Container(
-                  width: double.infinity,
-                  margin: const EdgeInsets.only(bottom: 8),
-                  padding: const EdgeInsets.all(8),
-                  decoration: BoxDecoration(
-                    color: Colors.black.withOpacity(0.15),
-                    borderRadius: BorderRadius.circular(8),
-                    border: const Border(
-                      left: BorderSide(
-                        color: Colors.white,
-                        width: 3,
-                      ),
-                    ),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-
-                      Text(
-                        message['reply_sender'] ?? '',
-                        style: const TextStyle(
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
-                          fontSize: 12,
-                        ),
-                      ),
-
-                      const SizedBox(height: 2),
-
-                      Text(
-                        message['reply_content'] ?? '',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Colors.white70,
-                          fontSize: 13,
-                        ),
-                      ),
-                    ],
-                  ),
+              Container(
+              width: double.infinity,
+              margin: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.15),
+                borderRadius: BorderRadius.circular(8),
+                border: const Border(
+                  left: BorderSide(color: Colors.white, width: 3),
                 ),
-              ],
-
-              /// Image
-              if (message['message_type'] == 'image')
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(12),
-                  child: Image.network(
-                    message['image_url'],
-                    width: 220,
-                    height: 220,
-                    fit: BoxFit.cover,
-                    loadingBuilder: (context, child, loadingProgress) {
-                      if (loadingProgress == null) return child;
-
-                      return SizedBox(
-                        width: 220,
-                        height: 220,
-                        child: Center(
-                          child: CircularProgressIndicator(
-                            value: loadingProgress.expectedTotalBytes != null
-                                ? loadingProgress.cumulativeBytesLoaded /
-                                loadingProgress.expectedTotalBytes!
-                                : null,
-                          ),
-                        ),
-                      );
-                    },
-                    errorBuilder: (context, error, stackTrace) {
-                      return const Center(
-                        child: Icon(Icons.error),
-                      );
-                    },
-                  ),
-                )
-
-              /// Voice
-              else if (message['message_type'] == 'voice')
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-
-                    IconButton(
-                      icon: Icon(
-                        playingVoiceId == message['id'] && isPlaying
-                            ? Icons.pause
-                            : Icons.play_arrow,
-                        color: Colors.white,
-                      ),
-                      onPressed: () async {
-
-                        final id = message['id'];
-
-                        if (playingVoiceId == id && isPlaying) {
-
-                          await audioPlayer.pause();
-
-                          setState(() {
-                            isPlaying = false;
-                          });
-
-                        } else {
-
-                          await audioPlayer.setUrl(
-                            message['content'],
-                          );
-
-                          await audioPlayer.play();
-
-                          setState(() {
-                            playingVoiceId = id;
-                            isPlaying = true;
-                          });
-
-                        }
-                      },
-                    ),
-
-                    const Text(
-                      "Voice message",
-                      style: TextStyle(fontSize: 15),
-                    ),
-                  ],
-                )
-
-              /// Text
-              else
-                Text(
-                  message['content'],
-                  style: TextStyle(
-                    color: isMe
-                        ? Colors.white
-                        : (isDarkMode ? Colors.white : Colors.black),
-                    fontSize: 16,
-                  ),
-                ),
-
-              const SizedBox(height: 4),
-
-              Row(
-                mainAxisSize: MainAxisSize.min,
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  Text(
+                    message['reply_sender'] ?? '',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                      fontSize: 12,
+                    ),
+                  ),
+
+                  const SizedBox(height: 2),
 
                   Text(
-                    time,
-                    style: TextStyle(
-                      color: isMe
-                          ? Colors.white70
-                          : (isDarkMode ? Colors.grey[400] : Colors.black54),
-                      fontSize: 11,
+                    message['reply_type'] == 'voice'
+                        ? '🎙 Voice message'
+                        : message['reply_type'] == 'image'
+                        ? '📷 Image'
+                        : message['reply_content'] ?? '',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
                     ),
                   ),
-
-                  if (isMe) ...[
-                    const SizedBox(width: 4),
-                    buildMessageStatus(message),
-                  ],
                 ],
               ),
+            ),
             ],
-          ),
-        ),
-      ),
+
+                    /// Image
+                    if (message['message_type'] == 'image')
+                      GestureDetector(
+                        onTap: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => FullScreenImagePage(
+                                imageUrl: message['image_url'],
+                              ),
+                            ),
+                          );
+                        },
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: Image.network(
+                            message['image_url'],
+                            width: 220,
+                            height: 220,
+                            fit: BoxFit.cover,
+                            loadingBuilder: (context, child, loadingProgress) {
+                              if (loadingProgress == null) {
+                                return child;
+                              }
+
+                              return SizedBox(
+                                width: 220,
+                                height: 220,
+                                child: Center(
+                                  child: CircularProgressIndicator(
+                                    value: loadingProgress.expectedTotalBytes != null
+                                        ? loadingProgress.cumulativeBytesLoaded /
+                                        loadingProgress.expectedTotalBytes!
+                                        : null,
+                                  ),
+                                ),
+                              );
+                            },
+                            errorBuilder: (context, error, stackTrace) {
+                              return const SizedBox(
+                                width: 220,
+                                height: 220,
+                                child: Center(
+                                  child: Icon(
+                                    Icons.broken_image,
+                                    size: 40,
+                                    color: Colors.grey,
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                      )
+
+    /// Voice
+    else if (message['message_type'] == 'voice')
+    Container(
+    width: 210,
+    padding: const EdgeInsets.symmetric(
+    horizontal: 8,
+    vertical: 6,
+    ),
+    child: Row(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+    // Play / Pause button
+    Container(
+    width: 42,
+    height: 42,
+    decoration: const BoxDecoration(
+    color: Colors.white,
+    shape: BoxShape.circle,
+    ),
+    child: IconButton(
+    padding: EdgeInsets.zero,
+    icon: Icon(
+    playingVoiceId == message['id'] && isPlaying
+    ? Icons.pause
+        : Icons.play_arrow,
+    color: Colors.blue,
+    size: 24,
+    ),
+    onPressed: () async {
+    final id = message['id'];
+
+    if (playingVoiceId == id && isPlaying) {
+    await audioPlayer.pause();
+
+    setState(() {
+    isPlaying = false;
+    });
+    } else {
+    await audioPlayer.setUrl(message['content']);
+
+    await audioPlayer.play();
+
+    setState(() {
+    playingVoiceId = id;
+    isPlaying = true;
+    });
+    }
+    },
+    ),
+    ),
+
+    const SizedBox(width: 10),
+
+    // Fake waveform
+    Expanded(
+    child: Row(
+    mainAxisAlignment: MainAxisAlignment.center,
+    crossAxisAlignment: CrossAxisAlignment.center,
+    children: [
+    for (final height in [
+    8.0,
+    14.0,
+    20.0,
+    11.0,
+    25.0,
+    16.0,
+    30.0,
+    18.0,
+    12.0,
+    23.0,
+    15.0,
+    27.0,
+    10.0,
+    19.0,
+    13.0,
+    ])
+    Container(
+    width: 3,
+    height: height,
+    margin: const EdgeInsets.symmetric(
+    horizontal: 2,
+    ),
+    decoration: BoxDecoration(
+    color: Colors.white70,
+    borderRadius: BorderRadius.circular(3),
+    ),
+    ),
+    ],
+    ),
+    ),
+    ],
+    ),
+    )
+    /// Text
+    else
+    Text(
+    message['content'],
+    style: TextStyle(
+    color: isMe
+    ? Colors.white
+        : (isDarkMode ? Colors.white : Colors.black),
+    fontSize: 16,
+    ),
+    ),
+
+    const SizedBox(height: 4),
+
+    Row(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+    Text(
+    time,
+    style: TextStyle(
+    color: isMe
+    ? Colors.white70
+        : (isDarkMode ? Colors.grey[400] : Colors.black54),
+    fontSize: 11,
+    ),
+    ),
+
+    if (isMe) ...[
+    const SizedBox(width: 4),
+    buildMessageStatus(message),
+    ],
+    ],
+    ),
+    ],
+    ),
+    ),
+    )
+    ,
     );
   }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor:
-      isDarkMode ? Colors.grey[900] : Colors.grey[100], // 👈 theme
+      backgroundColor: isDarkMode
+          ? Colors.grey[900]
+          : Colors.grey[100], // 👈 theme
 
       appBar: AppBar(
         elevation: 1,
         backgroundColor: isDarkMode ? Colors.black : Colors.white,
         leading: IconButton(
-          icon: Icon(Icons.arrow_back,
-              color: isDarkMode ? Colors.white : Colors.black),
+          icon: Icon(
+            Icons.arrow_back,
+            color: isDarkMode ? Colors.white : Colors.black,
+          ),
           onPressed: () => Navigator.pop(context),
         ),
         title: Row(
@@ -831,6 +901,7 @@ class _ChatPageState extends State<ChatPage> {
           ),
 
           // INPUT BAR
+          // INPUT BAR
           Container(
             decoration: BoxDecoration(
               color: isDarkMode ? Colors.black : Colors.white,
@@ -864,12 +935,10 @@ class _ChatPageState extends State<ChatPage> {
                     ),
                     child: Row(
                       children: [
-
                         Expanded(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-
                               const Text(
                                 "Replying to",
                                 style: TextStyle(
@@ -883,9 +952,18 @@ class _ChatPageState extends State<ChatPage> {
                               Text(
                                 replyingTo!['message_type'] == 'text'
                                     ? replyingTo!['content']
+                                    : replyingTo!['message_type'] == 'voice'
+                                    ? '🎙 Voice message'
+                                    : replyingTo!['message_type'] == 'image'
+                                    ? '📷 Image'
                                     : replyingTo!['message_type'].toUpperCase(),
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  color: isDarkMode
+                                      ? Colors.white
+                                      : Colors.black,
+                                ),
                               ),
                             ],
                           ),
@@ -897,6 +975,7 @@ class _ChatPageState extends State<ChatPage> {
                             setState(() {
                               replyingTo = null;
                             });
+
                             messageController.clear();
                           },
                         ),
@@ -904,11 +983,79 @@ class _ChatPageState extends State<ChatPage> {
                     ),
                   ),
 
+                /// RECORDING UI
+                if (isRecording)
+                  Container(
+                    width: double.infinity,
+                    margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 12,
+                    ),
+                    decoration: BoxDecoration(
+                      color: isDarkMode
+                          ? Colors.grey[850]
+                          : Colors.grey[200],
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: Row(
+                      children: [
+
+                        // Red recording indicator
+                        Container(
+                          width: 12,
+                          height: 12,
+                          decoration: const BoxDecoration(
+                            color: Colors.red,
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+
+                        const SizedBox(width: 10),
+
+                        const Text(
+                          "Recording",
+                          style: TextStyle(
+                            color: Colors.red,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 15,
+                          ),
+                        ),
+
+                        const SizedBox(width: 10),
+
+                        // Timer
+                        Text(
+                          _formatRecordingDuration(recordingDuration),
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            color: isDarkMode
+                                ? Colors.white
+                                : Colors.black87,
+                          ),
+                        ),
+
+                        const Spacer(),
+
+                        const Icon(
+                          Icons.mic,
+                          color: Colors.red,
+                        ),
+                      ],
+                    ),
+                  ),
+
+                /// INPUT
                 Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 10,
+                  ),
                   child: Row(
                     children: [
 
+                      /// Message field
                       Expanded(
                         child: Container(
                           decoration: BoxDecoration(
@@ -919,20 +1066,23 @@ class _ChatPageState extends State<ChatPage> {
                           ),
                           child: TextField(
                             controller: messageController,
+                            enabled: !isRecording,
                             style: TextStyle(
-                              color:
-                              isDarkMode ? Colors.white : Colors.black,
+                              color: isDarkMode
+                                  ? Colors.white
+                                  : Colors.black,
                             ),
                             decoration: InputDecoration(
-                              hintText: "Type a message...",
+                              hintText: isRecording
+                                  ? "Recording..."
+                                  : "Type a message...",
                               hintStyle: TextStyle(
                                 color: isDarkMode
                                     ? Colors.grey[400]
                                     : Colors.grey,
                               ),
                               border: InputBorder.none,
-                              contentPadding:
-                              const EdgeInsets.symmetric(
+                              contentPadding: const EdgeInsets.symmetric(
                                 horizontal: 20,
                                 vertical: 10,
                               ),
@@ -941,16 +1091,25 @@ class _ChatPageState extends State<ChatPage> {
                         ),
                       ),
 
-                      IconButton(
-                        icon: const Icon(Icons.attach_file),
-                        onPressed: pickAndSendImage,
-                      ),
+                      const SizedBox(width: 4),
+
+                      /// Attachment
+                      if (!isRecording)
+                        IconButton(
+                          icon: const Icon(Icons.attach_file),
+                          onPressed: pickAndSendImage,
+                        ),
 
                       const SizedBox(width: 4),
 
+                      /// Send / Record button
                       CircleAvatar(
-                        backgroundColor: Colors.blue,
-                        child: messageController.text.isNotEmpty
+                        backgroundColor: isRecording
+                            ? Colors.red
+                            : Colors.blue,
+
+                        child: messageController.text.isNotEmpty &&
+                            !isRecording
                             ? IconButton(
                           icon: const Icon(
                             Icons.send,
@@ -978,28 +1137,21 @@ class _ChatPageState extends State<ChatPage> {
                 ),
               ],
             ),
-          )
+          ),
         ],
       ),
     );
   }
+
   Widget buildMessageStatus(Map<String, dynamic> message) {
     final status = message['status'] ?? 'sent';
 
     switch (status) {
       case 'sent':
-        return const Icon(
-          Icons.done,
-          size: 16,
-          color: Colors.white70,
-        );
+        return const Icon(Icons.done, size: 16, color: Colors.white70);
 
       case 'delivered':
-        return const Icon(
-          Icons.done_all,
-          size: 16,
-          color: Colors.white70,
-        );
+        return const Icon(Icons.done_all, size: 16, color: Colors.white70);
 
       case 'read':
         return const Icon(
@@ -1011,5 +1163,64 @@ class _ChatPageState extends State<ChatPage> {
       default:
         return const SizedBox();
     }
+  }
+}
+class FullScreenImagePage extends StatelessWidget {
+  final String imageUrl;
+
+  const FullScreenImagePage({
+    super.key,
+    required this.imageUrl,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
+        elevation: 0,
+      ),
+      body: Center(
+        child: InteractiveViewer(
+          minScale: 0.5,
+          maxScale: 4.0,
+          child: Image.network(
+            imageUrl,
+            fit: BoxFit.contain,
+            loadingBuilder: (context, child, loadingProgress) {
+              if (loadingProgress == null) {
+                return child;
+              }
+
+              return const CircularProgressIndicator(
+                color: Colors.white,
+              );
+            },
+            errorBuilder: (context, error, stackTrace) {
+              return const Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.broken_image,
+                    color: Colors.white,
+                    size: 60,
+                  ),
+                  SizedBox(height: 12),
+                  Text(
+                    "Unable to load image",
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 16,
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
   }
 }
